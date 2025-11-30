@@ -1,4 +1,4 @@
-# !pip install mne xgboost lightgbm
+# !pip install mne xgboost lightgbm ripser
 # !pip install --upgrade numpy pandas mne scikit-learn
 
 import os
@@ -9,6 +9,7 @@ import pandas as pd
 import mne
 import io
 from scipy import signal
+from ripser import ripser
 
 # ML Imports
 from sklearn.model_selection import GroupShuffleSplit
@@ -26,8 +27,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 warnings.filterwarnings('ignore')
-
-
 
 BASE_PATH = 'StrokeEEG'
 mne.set_log_file(fname=os.devnull, overwrite=True)
@@ -177,7 +176,49 @@ for patient_id, eeg_array in stroke_eeg.items():
 print(f"Total subjects epoched: {len(stroke_epochs)}")
 
 # ==========================================
-# 5. FEATURE EXTRACTION (WITHOUT TDA)
+# 5. FAST TDA FEATURE COMPUTATION
+# ==========================================
+
+def compute_fast_tda_features(band_power_sequence):
+    """
+    Fast TDA using correlation-based point cloud and H0 only.
+    Input: band_power_sequence (n_channels,) - band power values
+    Output: dict of TDA features
+    """
+    try:
+        # Create simple 2D embedding from band powers
+        n_ch = len(band_power_sequence)
+        if n_ch < 3:
+            return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+        
+        # Use correlation structure as point cloud (fast, no PCA needed)
+        points = np.column_stack([
+            band_power_sequence,
+            np.roll(band_power_sequence, 1),
+            np.roll(band_power_sequence, 2)
+        ])[:10]  # Use only first 10 channels for speed
+        
+        # Compute only H0 (connected components) - much faster than H1
+        result = ripser(points, maxdim=0, thresh=2.0)
+        dgm = result['dgms'][0]
+        
+        # Extract simple statistics
+        if len(dgm) > 0:
+            pers = dgm[:, 1] - dgm[:, 0]
+            pers = pers[np.isfinite(pers)]
+            if len(pers) > 0:
+                return {
+                    'tda_h0_max': np.max(pers),
+                    'tda_h0_mean': np.mean(pers),
+                    'tda_h0_count': len(pers)
+                }
+        
+        return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+    except:
+        return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+
+# ==========================================
+# 6. FEATURE EXTRACTION (WITH FAST TDA)
 # ==========================================
 
 BANDS = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 13), 'beta': (13, 30)}
@@ -187,7 +228,7 @@ all_features = []
 first_sub = list(stroke_epochs.keys())[0]
 ch_names = stroke_epochs[first_sub].ch_names
 
-print("--- Starting Feature Extraction ---")
+print("--- Starting Feature Extraction (with Fast TDA) ---")
 
 for patient_id, epochs in stroke_epochs.items():
     data = epochs.get_data()
@@ -203,6 +244,7 @@ for patient_id, epochs in stroke_epochs.items():
 
             feat_dict[f'{band}_mean'] = np.mean(band_power)
 
+            # Asymmetry features
             for (left_ch, right_ch) in PAIRS:
                 if left_ch in ch_names and right_ch in ch_names:
                     idx_l = ch_names.index(left_ch)
@@ -211,14 +253,20 @@ for patient_id, epochs in stroke_epochs.items():
                     p_r = band_power[idx_r]
                     asym = (p_l - p_r) / (p_l + p_r + 1e-9)
                     feat_dict[f'{band}_asym_{left_ch}_{right_ch}'] = asym
+            
+            # Add fast TDA features for each band
+            tda_feats = compute_fast_tda_features(band_power)
+            for k, v in tda_feats.items():
+                feat_dict[f'{band}_{k}'] = v
 
         all_features.append(feat_dict)
 
 feature_df = pd.DataFrame(all_features)
 print(f"\nExtraction Complete. Shape: {feature_df.shape}")
+print(f"Features per epoch: {len(feature_df.columns) - 1}")  # -1 for subject_id
 
 # ==========================================
-# 6. PREPARE DATA FOR PARALYSIS SIDE PREDICTION
+# 7. PREPARE DATA FOR PARALYSIS SIDE PREDICTION
 # ==========================================
 
 target_col = 'ParalysisSide'
@@ -254,7 +302,7 @@ print(f"Test subjects: {len(test_subjects.unique())}")
 print(f"Test subject IDs: {sorted(test_subjects.unique())}")
 
 # ==========================================
-# 7. DEFINE MULTIPLE MODELS
+# 8. DEFINE MULTIPLE MODELS
 # ==========================================
 
 models = {
@@ -268,7 +316,7 @@ models = {
 }
 
 # ==========================================
-# 8. TRAIN AND EVALUATE ALL MODELS
+# 9. TRAIN AND EVALUATE ALL MODELS
 # ==========================================
 
 results_summary = []
@@ -344,7 +392,7 @@ for model_name, classifier in models.items():
     plt.show()
 
 # ==========================================
-# 9. COMPARE ALL MODELS
+# 10. COMPARE ALL MODELS
 # ==========================================
 
 print("\n" + "="*60)

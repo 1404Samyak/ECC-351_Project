@@ -1,14 +1,14 @@
-# !pip install mne xgboost lightgbm
+# !pip install mne xgboost lightgbm ripser
 # !pip install --upgrade numpy pandas mne scikit-learn
 
 import os
-import zipfile
 import warnings
 import numpy as np
 import pandas as pd
 import mne
 import io
 from scipy import signal
+from ripser import ripser
 
 # ML Imports
 from sklearn.model_selection import GroupShuffleSplit
@@ -27,21 +27,16 @@ import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
-
-
 BASE_PATH = 'StrokeEEG'
 mne.set_log_file(fname=os.devnull, overwrite=True)
 
 # ==========================================
-# 2. DATA LOADING
+# 1. DATA LOADING
 # ==========================================
 
 stroke_eeg = {}
-total_signals_loaded = 0
-
 if os.path.exists(BASE_PATH):
-    patient_folders = [d for d in os.listdir(BASE_PATH) if os.path.isdir(os.path.join(BASE_PATH, d))]
-    patient_folders.sort()
+    patient_folders = sorted([d for d in os.listdir(BASE_PATH) if os.path.isdir(os.path.join(BASE_PATH, d))])
     print(f"\nDetected {len(patient_folders)} patient folders.\n")
 
     for patient_folder_name in patient_folders:
@@ -51,26 +46,20 @@ if os.path.exists(BASE_PATH):
         edf_files = [f for f in os.listdir(eeg_data_path) if f.endswith(".edf")]
         if not edf_files: continue
 
-        patient_data_arrays = []
         for edf_file_name in edf_files:
             full_edf_path = os.path.join(eeg_data_path, edf_file_name)
             try:
                 raw = mne.io.read_raw_edf(full_edf_path, preload=True)
-                patient_data_arrays.append(raw.get_data())
-                total_signals_loaded += 1
+                stroke_eeg[patient_folder_name] = raw.get_data()
+                break  # Only first EDF file
             except Exception as e:
                 print(f"Error loading {full_edf_path}: {e}")
                 continue
 
-        if patient_data_arrays:
-            stroke_eeg[patient_folder_name] = patient_data_arrays[0]
-else:
-    print("Base path not found. Check extraction.")
-
 print(f"| Total Patients Loaded: {len(stroke_eeg)}")
 
 # ==========================================
-# 3. METADATA SETUP
+# 2. METADATA + STROKE LOCATION CLEANING
 # ==========================================
 
 metadata_table = """
@@ -129,11 +118,28 @@ sub-50	female	64	1	left	right	yes	Right pons	3	85	2
 
 subject_labels_df = pd.read_csv(io.StringIO(metadata_table), sep='\t')
 subject_labels_df.rename(columns={'Participant_ID': 'subject_id'}, inplace=True)
+
+# Clean stroke location
+def categorize_stroke_location(loc):
+    if pd.isna(loc): return 'unclear'
+    s = str(loc).lower()
+    if 'bilateral' in s or s.strip() == 'pons': return 'bilateral'
+    left_c, right_c = s.count('left'), s.count('right')
+    if left_c > 0 and right_c > 0: return 'bilateral'
+    if left_c > 0: return 'left'
+    if right_c > 0: return 'right'
+    return 'unclear'
+
+subject_labels_df['StrokeLocation_Category'] = subject_labels_df['StrokeLocation'].apply(categorize_stroke_location)
+subject_labels_df = subject_labels_df[subject_labels_df['StrokeLocation_Category'].isin(['left', 'right'])]
+
+# Match with loaded EEG
 loaded_subjects = list(stroke_eeg.keys())
-final_labels_df = subject_labels_df[subject_labels_df['subject_id'].isin(loaded_subjects)]
+final_labels_df = subject_labels_df[subject_labels_df['subject_id'].isin(loaded_subjects)].copy()
+print(f"\n✅ Usable subjects after filtering: {len(final_labels_df)}")
 
 # ==========================================
-# 4. PREPROCESSING & EPOCHING
+# 3. PREPROCESSING & EPOCHING
 # ==========================================
 
 SFREQ = 250.0
@@ -150,26 +156,25 @@ EXPLICIT_31_CHANNEL_NAMES = [
 FINAL_CHANNEL_NAMES_33 = EXPLICIT_31_CHANNEL_NAMES + ['STATUS1', 'STATUS2']
 
 stroke_epochs = {}
+print("--- Preprocessing ---")
 
-print("--- Preprocessing Pipeline ---")
 for patient_id, eeg_array in stroke_eeg.items():
+    if patient_id not in final_labels_df['subject_id'].values:
+        continue
     try:
         info = mne.create_info(ch_names=FINAL_CHANNEL_NAMES_33, sfreq=SFREQ, ch_types='eeg')
         raw = mne.io.RawArray(eeg_array, info, verbose=False)
-        raw.set_channel_types({'HEOL': 'eog', 'VEOR': 'eog','STATUS1':'stim','STATUS2':'misc'})
-
+        raw.set_channel_types({'HEOL': 'eog', 'VEOR': 'eog', 'STATUS1': 'stim', 'STATUS2': 'misc'})
         montage = mne.channels.make_standard_montage('standard_1020')
         raw.set_montage(montage, on_missing='ignore', verbose=False)
-
-        if raw.info['sfreq'] != SFREQ: raw.resample(SFREQ, verbose=False)
+        if raw.info['sfreq'] != SFREQ:
+            raw.resample(SFREQ, verbose=False)
         raw.notch_filter(freqs=NOTCH_FREQ, verbose=False)
         raw.filter(l_freq=L_FREQ, h_freq=H_FREQ, verbose=False)
-        raw.set_eeg_reference('average', projection=False, verbose=False)
-
-        raw_epoched = raw.copy().pick_types(eeg=True, exclude='bads')
+        raw.set_eeg_reference('average', verbose=False)
+        raw_epoched = raw.copy().pick_types(eeg=True)
         events = mne.make_fixed_length_events(raw_epoched, duration=STEP_S, start=0.0)
         epochs = mne.Epochs(raw_epoched, events, tmin=0, tmax=TMAX, baseline=None, preload=True, verbose=False)
-
         stroke_epochs[patient_id] = epochs
     except Exception as e:
         print(f"Skipping {patient_id}: {e}")
@@ -177,7 +182,44 @@ for patient_id, eeg_array in stroke_eeg.items():
 print(f"Total subjects epoched: {len(stroke_epochs)}")
 
 # ==========================================
-# 5. FEATURE EXTRACTION (WITHOUT TDA)
+# 4. FAST TDA FEATURE FUNCTION
+# ==========================================
+
+def compute_fast_tda_features(band_power):
+    """Fast TDA: H0 persistence from 3D delay embedding of band power (first 10 channels)"""
+    try:
+        n = len(band_power)
+        if n < 3:
+            return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+        
+        # Use first 10 channels for speed
+        x = band_power[:10]
+        if len(x) < 3:
+            x = np.pad(x, (0, 3 - len(x)), constant_values=0)
+        
+        # 3D delay embedding
+        points = np.column_stack([x, np.roll(x, -1), np.roll(x, -2)])[:len(x)]
+        
+        # Compute H0 only (connected components)
+        dgm = ripser(points, maxdim=0, thresh=2.0)['dgms'][0]
+        if len(dgm) == 0:
+            return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+        
+        pers = dgm[:, 1] - dgm[:, 0]
+        pers = pers[np.isfinite(pers) & (pers > 0)]
+        if len(pers) == 0:
+            return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+        
+        return {
+            'tda_h0_max': float(np.max(pers)),
+            'tda_h0_mean': float(np.mean(pers)),
+            'tda_h0_count': int(len(pers))
+        }
+    except:
+        return {'tda_h0_max': 0, 'tda_h0_mean': 0, 'tda_h0_count': 0}
+
+# ==========================================
+# 5. FEATURE EXTRACTION (WITH TDA)
 # ==========================================
 
 BANDS = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 13), 'beta': (13, 30)}
@@ -187,61 +229,56 @@ all_features = []
 first_sub = list(stroke_epochs.keys())[0]
 ch_names = stroke_epochs[first_sub].ch_names
 
-print("--- Starting Feature Extraction ---")
+print("--- Feature Extraction with TDA ---")
 
 for patient_id, epochs in stroke_epochs.items():
     data = epochs.get_data()
-
-    for idx, epoch in enumerate(data):
-        feat_dict = {'subject_id': patient_id}
-
+    for epoch in data:
+        feat = {'subject_id': patient_id}
         freqs, psd = signal.welch(epoch, fs=SFREQ, nperseg=256)
-
+        
         for band, (lf, hf) in BANDS.items():
-            freq_mask = (freqs >= lf) & (freqs <= hf)
-            band_power = np.trapz(psd[:, freq_mask], freqs[freq_mask], axis=1)
-
-            feat_dict[f'{band}_mean'] = np.mean(band_power)
-
-            for (left_ch, right_ch) in PAIRS:
-                if left_ch in ch_names and right_ch in ch_names:
-                    idx_l = ch_names.index(left_ch)
-                    idx_r = ch_names.index(right_ch)
-                    p_l = band_power[idx_l]
-                    p_r = band_power[idx_r]
-                    asym = (p_l - p_r) / (p_l + p_r + 1e-9)
-                    feat_dict[f'{band}_asym_{left_ch}_{right_ch}'] = asym
-
-        all_features.append(feat_dict)
+            mask = (freqs >= lf) & (freqs <= hf)
+            band_power = np.trapz(psd[:, mask], freqs[mask], axis=1)
+            
+            feat[f'{band}_mean'] = np.mean(band_power)
+            
+            # Asymmetry
+            for l_ch, r_ch in PAIRS:
+                if l_ch in ch_names and r_ch in ch_names:
+                    il, ir = ch_names.index(l_ch), ch_names.index(r_ch)
+                    pl, pr = band_power[il], band_power[ir]
+                    asym = (pl - pr) / (pl + pr + 1e-9)
+                    feat[f'{band}_asym_{l_ch}_{r_ch}'] = asym
+            
+            # TDA features
+            tda = compute_fast_tda_features(band_power)
+            for k, v in tda.items():
+                feat[f'{band}_{k}'] = v
+        
+        all_features.append(feat)
 
 feature_df = pd.DataFrame(all_features)
-print(f"\nExtraction Complete. Shape: {feature_df.shape}")
+print(f"✅ Feature extraction done. Shape: {feature_df.shape}")
 
 # ==========================================
-# 6. PREPARE DATA FOR PARALYSIS SIDE PREDICTION
+# 6. PREPARE DATA FOR STROKE LOCATION PREDICTION
 # ==========================================
 
-target_col = 'ParalysisSide'
-
-print("\n" + "="*60)
-print(f" MULTI-MODEL CLASSIFICATION FOR {target_col.upper()} ")
-print("="*60)
-
+target_col = 'StrokeLocation_Category'
 merged_df = feature_df.merge(final_labels_df[['subject_id', target_col]], on='subject_id', how='inner')
-merged_df.dropna(subset=[target_col], inplace=True)
+merged_df = merged_df.dropna(subset=[target_col])
 
 le = LabelEncoder()
-merged_df['target'] = le.fit_transform(merged_df[target_col].astype(str))
+merged_df['target'] = le.fit_transform(merged_df[target_col])
 class_names = le.classes_
+print(f"Classes: {class_names}")
 
-print(f"Classes found: {class_names}")
-
-drop_cols = ['subject_id', 'target', target_col]
-X = merged_df.drop(columns=[c for c in drop_cols if c in merged_df.columns])
+X = merged_df.drop(columns=['subject_id', 'target', target_col])
 y = merged_df['target']
 groups = merged_df['subject_id']
 
-# Split Data
+# 75-25 subject-wise split
 gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
 train_idx, test_idx = next(gss.split(X, y, groups))
 
@@ -251,15 +288,14 @@ test_subjects = groups.iloc[test_idx]
 
 print(f"\nTrain subjects: {len(groups.iloc[train_idx].unique())}")
 print(f"Test subjects: {len(test_subjects.unique())}")
-print(f"Test subject IDs: {sorted(test_subjects.unique())}")
 
 # ==========================================
-# 7. DEFINE MULTIPLE MODELS
+# 7. MODELS & EVALUATION
 # ==========================================
 
 models = {
     'Random Forest': RandomForestClassifier(n_estimators=200, max_depth=10, class_weight='balanced', random_state=42),
-    'XGBoost': XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, class_weight='balanced', random_state=42, use_label_encoder=False, eval_metric='logloss'),
+    'XGBoost': XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42, eval_metric='logloss', use_label_encoder=False),
     'AdaBoost': AdaBoostClassifier(n_estimators=100, learning_rate=1.0, random_state=42),
     'Gradient Boosting': GradientBoostingClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42),
     'LightGBM': LGBMClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, class_weight='balanced', random_state=42, verbose=-1),
@@ -267,101 +303,59 @@ models = {
     'RBF SVM': SVC(kernel='rbf', C=1.0, gamma='scale', class_weight='balanced', random_state=42, probability=True)
 }
 
-# ==========================================
-# 8. TRAIN AND EVALUATE ALL MODELS
-# ==========================================
-
 results_summary = []
 
-for model_name, classifier in models.items():
-    print(f"\n{'='*60}")
-    print(f"Training: {model_name}")
-    print('='*60)
+for name, clf in models.items():
+    print(f"\n{'='*50}\nTraining: {name}\n{'='*50}")
     
-    # Create Pipeline
-    pipeline = Pipeline([
+    pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='mean')),
         ('scaler', StandardScaler()),
-        ('feature_selection', SelectFromModel(RandomForestClassifier(n_estimators=50, random_state=42), threshold='median')),
-        ('clf', classifier)
+        ('selector', SelectFromModel(RandomForestClassifier(n_estimators=50, random_state=42), threshold='median')),
+        ('clf', clf)
     ])
     
-    # Train
-    pipeline.fit(X_train, y_train)
+    pipe.fit(X_train, y_train)
+    y_pred_epoch = pipe.predict(X_test)
     
-    # Predict at epoch level
-    y_pred_epochs = pipeline.predict(X_test)
+    # Patient-level aggregation
+    res_df = pd.DataFrame({'subject': test_subjects, 'y_true': y_test, 'y_pred': y_pred_epoch})
+    patient_preds, patient_trues = [], []
+    for subj in res_df['subject'].unique():
+        sub_data = res_df[res_df['subject'] == subj]
+        patient_trues.append(sub_data['y_true'].iloc[0])
+        patient_preds.append(sub_data['y_pred'].mode()[0])  # Majority vote
     
-    # Aggregate to patient level (majority voting)
-    results_df = pd.DataFrame({
-        'subject': test_subjects.values, 
-        'y_true': y_test.values, 
-        'y_pred': y_pred_epochs
-    })
-    
-    # Patient-level aggregation with proper mode handling
-    patient_preds = []
-    patient_trues = []
-    
-    for subject in results_df['subject'].unique():
-        subject_data = results_df[results_df['subject'] == subject]
-        
-        # True label (should be same for all epochs of a subject)
-        true_label = subject_data['y_true'].iloc[0]
-        patient_trues.append(true_label)
-        
-        # Predicted label (majority vote across epochs)
-        pred_counts = subject_data['y_pred'].value_counts()
-        pred_label = pred_counts.idxmax()
-        patient_preds.append(pred_label)
-    
-    patient_trues = np.array(patient_trues)
-    patient_preds = np.array(patient_preds)
-    
-    # Calculate Accuracy
     acc = accuracy_score(patient_trues, patient_preds)
-    
-    print(f"\n✅ {model_name} PATIENT ACCURACY: {acc:.4f}")
-    print(f"Total test patients: {len(patient_trues)}")
-    print("-" * 60)
+    print(f"✅ Patient Accuracy: {acc:.4f}")
     print(classification_report(patient_trues, patient_preds, target_names=class_names))
     
-    # Store results
-    results_summary.append({
-        'Model': model_name,
-        'Accuracy': acc
-    })
+    results_summary.append({'Model': name, 'Accuracy': acc})
     
-    # Plot Confusion Matrix
-    plt.figure(figsize=(5, 4))
+    # Confusion matrix
+    plt.figure(figsize=(5,4))
     cm = confusion_matrix(patient_trues, patient_preds)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=class_names, yticklabels=class_names)
-    plt.title(f"Confusion Matrix: {model_name}")
-    plt.ylabel("Actual")
-    plt.xlabel("Predicted")
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.title(f'Confusion Matrix: {name}')
+    plt.ylabel('Actual'); plt.xlabel('Predicted')
     plt.tight_layout()
     plt.show()
 
 # ==========================================
-# 9. COMPARE ALL MODELS
+# 8. FINAL COMPARISON
 # ==========================================
 
+summary = pd.DataFrame(results_summary).sort_values('Accuracy', ascending=False)
 print("\n" + "="*60)
-print(" MODEL COMPARISON SUMMARY ")
+print("MODEL COMPARISON (Patient-Level Accuracy)")
 print("="*60)
+print(summary.to_string(index=False))
 
-results_df_summary = pd.DataFrame(results_summary).sort_values('Accuracy', ascending=False)
-print(results_df_summary.to_string(index=False))
-
-# Bar plot comparison
-plt.figure(figsize=(10, 6))
-plt.barh(results_df_summary['Model'], results_df_summary['Accuracy'], color='steelblue')
-plt.xlabel('Patient-Level Accuracy')
-plt.title(f'Model Comparison for {target_col} Prediction')
-plt.xlim(0, 1)
-plt.grid(axis='x', alpha=0.3)
+plt.figure(figsize=(10,6))
+plt.barh(summary['Model'], summary['Accuracy'], color='steelblue')
+plt.xlabel('Accuracy'); plt.title('Stroke Location Prediction (with TDA Features)')
+plt.xlim(0,1); plt.grid(axis='x', alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-print("\n✅ All models trained and evaluated successfully!")
+print("\n✅ Stroke location prediction with TDA completed successfully!")

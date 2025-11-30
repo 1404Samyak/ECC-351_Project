@@ -27,8 +27,6 @@ import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
-
-
 BASE_PATH = 'StrokeEEG'
 mne.set_log_file(fname=os.devnull, overwrite=True)
 
@@ -59,7 +57,7 @@ if os.path.exists(BASE_PATH):
                 patient_data_arrays.append(raw.get_data())
                 total_signals_loaded += 1
             except Exception as e:
-                print(f"Error loading {full_edf_path}: {e}")
+                print(f"Error loading {full_edf_path}: {e}")    
                 continue
 
         if patient_data_arrays:
@@ -70,7 +68,7 @@ else:
 print(f"| Total Patients Loaded: {len(stroke_eeg)}")
 
 # ==========================================
-# 3. METADATA SETUP
+# 3. METADATA SETUP + STROKE LOCATION CLEANING
 # ==========================================
 
 metadata_table = """
@@ -129,8 +127,36 @@ sub-50	female	64	1	left	right	yes	Right pons	3	85	2
 
 subject_labels_df = pd.read_csv(io.StringIO(metadata_table), sep='\t')
 subject_labels_df.rename(columns={'Participant_ID': 'subject_id'}, inplace=True)
+
+# === NEW: Stroke Location Categorization ===
+def categorize_stroke_location(location_str):
+    if pd.isna(location_str):
+        return 'unclear'
+    loc = str(location_str).lower()
+    if 'bilateral' in loc or loc.strip() == 'pons':
+        return 'bilateral'
+    left_count = loc.count('left')
+    right_count = loc.count('right')
+    if left_count > 0 and right_count > 0:
+        return 'bilateral'
+    elif left_count > 0:
+        return 'left'
+    elif right_count > 0:
+        return 'right'
+    else:
+        return 'unclear'
+
+subject_labels_df['StrokeLocation_Category'] = subject_labels_df['StrokeLocation'].apply(categorize_stroke_location)
+
+# Only keep 'left' and 'right'
+subject_labels_df = subject_labels_df[subject_labels_df['StrokeLocation_Category'].isin(['left', 'right'])]
+
 loaded_subjects = list(stroke_eeg.keys())
-final_labels_df = subject_labels_df[subject_labels_df['subject_id'].isin(loaded_subjects)]
+final_labels_df = subject_labels_df[subject_labels_df['subject_id'].isin(loaded_subjects)].copy()
+
+print(f"\n✅ After filtering: {len(final_labels_df)} subjects with clear left/right stroke.")
+print("Distribution:")
+print(final_labels_df['StrokeLocation_Category'].value_counts())
 
 # ==========================================
 # 4. PREPROCESSING & EPOCHING
@@ -153,6 +179,8 @@ stroke_epochs = {}
 
 print("--- Preprocessing Pipeline ---")
 for patient_id, eeg_array in stroke_eeg.items():
+    if patient_id not in final_labels_df['subject_id'].values:
+        continue  # Skip filtered-out subjects
     try:
         info = mne.create_info(ch_names=FINAL_CHANNEL_NAMES_33, sfreq=SFREQ, ch_types='eeg')
         raw = mne.io.RawArray(eeg_array, info, verbose=False)
@@ -177,7 +205,7 @@ for patient_id, eeg_array in stroke_eeg.items():
 print(f"Total subjects epoched: {len(stroke_epochs)}")
 
 # ==========================================
-# 5. FEATURE EXTRACTION (WITHOUT TDA)
+# 5. FEATURE EXTRACTION
 # ==========================================
 
 BANDS = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 13), 'beta': (13, 30)}
@@ -218,10 +246,10 @@ feature_df = pd.DataFrame(all_features)
 print(f"\nExtraction Complete. Shape: {feature_df.shape}")
 
 # ==========================================
-# 6. PREPARE DATA FOR PARALYSIS SIDE PREDICTION
+# 6. PREPARE DATA FOR STROKE LOCATION PREDICTION
 # ==========================================
 
-target_col = 'ParalysisSide'
+target_col = 'StrokeLocation_Category'
 
 print("\n" + "="*60)
 print(f" MULTI-MODEL CLASSIFICATION FOR {target_col.upper()} ")
@@ -241,7 +269,7 @@ X = merged_df.drop(columns=[c for c in drop_cols if c in merged_df.columns])
 y = merged_df['target']
 groups = merged_df['subject_id']
 
-# Split Data
+# Split Data: 75% train, 25% test, subject-wise
 gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
 train_idx, test_idx = next(gss.split(X, y, groups))
 
@@ -259,7 +287,8 @@ print(f"Test subject IDs: {sorted(test_subjects.unique())}")
 
 models = {
     'Random Forest': RandomForestClassifier(n_estimators=200, max_depth=10, class_weight='balanced', random_state=42),
-    'XGBoost': XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, class_weight='balanced', random_state=42, use_label_encoder=False, eval_metric='logloss'),
+    'XGBoost': XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, 
+                            random_state=42, eval_metric='logloss', use_label_encoder=False),
     'AdaBoost': AdaBoostClassifier(n_estimators=100, learning_rate=1.0, random_state=42),
     'Gradient Boosting': GradientBoostingClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42),
     'LightGBM': LGBMClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, class_weight='balanced', random_state=42, verbose=-1),
@@ -278,7 +307,6 @@ for model_name, classifier in models.items():
     print(f"Training: {model_name}")
     print('='*60)
     
-    # Create Pipeline
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='mean')),
         ('scaler', StandardScaler()),
@@ -286,39 +314,26 @@ for model_name, classifier in models.items():
         ('clf', classifier)
     ])
     
-    # Train
     pipeline.fit(X_train, y_train)
-    
-    # Predict at epoch level
     y_pred_epochs = pipeline.predict(X_test)
     
-    # Aggregate to patient level (majority voting)
     results_df = pd.DataFrame({
         'subject': test_subjects.values, 
         'y_true': y_test.values, 
         'y_pred': y_pred_epochs
     })
     
-    # Patient-level aggregation with proper mode handling
     patient_preds = []
     patient_trues = []
-    
     for subject in results_df['subject'].unique():
         subject_data = results_df[results_df['subject'] == subject]
-        
-        # True label (should be same for all epochs of a subject)
         true_label = subject_data['y_true'].iloc[0]
+        pred_label = subject_data['y_pred'].value_counts().idxmax()
         patient_trues.append(true_label)
-        
-        # Predicted label (majority vote across epochs)
-        pred_counts = subject_data['y_pred'].value_counts()
-        pred_label = pred_counts.idxmax()
         patient_preds.append(pred_label)
     
     patient_trues = np.array(patient_trues)
     patient_preds = np.array(patient_preds)
-    
-    # Calculate Accuracy
     acc = accuracy_score(patient_trues, patient_preds)
     
     print(f"\n✅ {model_name} PATIENT ACCURACY: {acc:.4f}")
@@ -326,13 +341,8 @@ for model_name, classifier in models.items():
     print("-" * 60)
     print(classification_report(patient_trues, patient_preds, target_names=class_names))
     
-    # Store results
-    results_summary.append({
-        'Model': model_name,
-        'Accuracy': acc
-    })
+    results_summary.append({'Model': model_name, 'Accuracy': acc})
     
-    # Plot Confusion Matrix
     plt.figure(figsize=(5, 4))
     cm = confusion_matrix(patient_trues, patient_preds)
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
@@ -354,7 +364,6 @@ print("="*60)
 results_df_summary = pd.DataFrame(results_summary).sort_values('Accuracy', ascending=False)
 print(results_df_summary.to_string(index=False))
 
-# Bar plot comparison
 plt.figure(figsize=(10, 6))
 plt.barh(results_df_summary['Model'], results_df_summary['Accuracy'], color='steelblue')
 plt.xlabel('Patient-Level Accuracy')
