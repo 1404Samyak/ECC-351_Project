@@ -90,7 +90,7 @@ The pipeline ensures the EEG signals retain only physiologically meaningful comp
 
 ---
 
-## 🚀 Future Work
+## Future Work
 
 1.  **Stroke Prediction:** Develop a diagnostic model to predict acute stroke occurrence using EEG signals, comparing EEG features between stroke patients and non-stroke healthy controls.
 2.  **Deep Learning and Explainable AI (XAI):** Enhance accuracy and clinical interpretability using Deep Learning (CNN/RNN) on spatiotemporal EEG data and XAI techniques (LIME/SHAP).
