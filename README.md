@@ -96,3 +96,16 @@ The pipeline ensures the EEG signals retain only physiologically meaningful comp
 2.  **Deep Learning and Explainable AI (XAI):** Enhance accuracy and clinical interpretability using Deep Learning (CNN/RNN) on spatiotemporal EEG data and XAI techniques (LIME/SHAP).
 3.  **Integrative Multi-Modal Data Fusion:** Design a Multi-Modal Machine Learning framework to systematically fuse EEG features, clinical scores (NIHSS/mRS), and neuroimaging metrics.
 4.  **Longitudinal Analysis for Recovery Monitoring:** Conduct a longitudinal study collecting repeated EEG/clinical data (e.g., 3, 6, 12 months) to track and predict functional recovery over time.
+
+## References
+[1]  F. H. Alghamedy *et al.*, “EEG-Driven Machine Learning for Stroke Detection in High-Risk Patients,” *IEEE Access*, vol. 13, pp. 166593–166608, 2025.
+[2] Cleveland Clinic, “NIH Stroke Scale (NIHSS) – Test for Stroke Severity,”
+[3] European Stroke Organisation (ESO), “Outcome Measures in Stroke: Modified Rankin Scale (mRS),”
+[4] C. Y.-F. Ling, P. Phang, and S.-H. Liew, “Topological data analysis in EEG signal processing: A review,”
+[5] Figshare, “EEG datasets of stroke patients,” 2024. Available:
+
+## Collaborators
+1. Rajat Badaria
+2. Samyak Mahapatra
+3. Pranav Reddy Pedaballe
+4. Raunak Gupta
